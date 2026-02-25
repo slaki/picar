@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>RC Car — WebRTC + Keyboard</title>
+<style>
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#0b1020; color:#eaf2ff; display:grid; place-items:center; min-height:100vh;}
+  .wrap { width:min(1000px,95vw); padding:18px; border-radius:16px; background:linear-gradient(180deg,#121a36,#0e1429); border:1px solid rgba(255,255,255,.08); box-shadow:0 10px 35px rgba(0,0,0,.35);}
+  h1 { margin:0 0 10px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+  input[type=text]{ padding:10px 12px; border-radius:10px; border:1px solid rgba(255,255,255,.15); background:#0c1228; color:#eaf2ff; width:360px;}
+  button{ padding:10px 14px; border-radius:10px; border:none; font-weight:700; cursor:pointer;}
+  .primary{ background:#7aa2ff; color:#081022;}
+  .secondary{ background:#1f2b56; color:#eaf2ff;}
+  .status{ margin-left:auto; display:flex; align-items:center; gap:8px; color:#a8b6d9;}
+  .dot{ width:10px; height:10px; border-radius:50%; background:#666;}
+  .ok{ background:#55d68a!important;}
+  .err{ background:#ff6b6b!important;}
+  video{ width:100%; max-height:60vh; background:#000; border-radius:12px; margin-top:12px;}
+  .grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:10px;}
+  .card{ background:#0b1226; border:1px solid rgba(255,255,255,.06); border-radius:12px; padding:10px;}
+  .bar{ height:18px; background:#0a0f20; border-radius:10px; position:relative; overflow:hidden;}
+  .fill{ position:absolute; top:0; bottom:0; left:50%; width:0%; background:linear-gradient(90deg,#6ea2ff,#8cc1ff);}
+  .neg .fill{ left:0; background:linear-gradient(90deg,#ff7a7a,#ffadad);}
+  .tiny{ color:#a8b6d9; font-size:12px;}
+  .num{ width:110px; padding:6px 8px; border-radius:8px; border:1px solid rgba(255,255,255,.15); background:#0c1228; color:#eaf2ff;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>RC Car — WebRTC + Keyboard</h1>
+  <div class="row">
+    <input id="wsurl" type="text" value="ws://192.168.0.97:8765" />
+    <button id="connect" class="primary">Connect</button>
+    <button id="disconnect" class="secondary">Disconnect</button>
+    <span class="status"><span id="dot" class="dot"></span><span id="stat">disconnected</span></span>
+  </div>
+
+  <video id="video" autoplay playsinline muted></video>
+
+  <div class="grid">
+    <div class="card">
+      <div class="tiny">Steering</div>
+      <div id="sbar" class="bar"><div id="sfill" class="fill"></div></div>
+      <div class="tiny">Value: <span id="sval">0.00</span></div>
+    </div>
+    <div class="card">
+      <div class="tiny">Throttle</div>
+      <div id="tbar" class="bar"><div id="tfill" class="fill"></div></div>
+      <div class="tiny">Value: <span id="tval">0.00</span></div>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:10px;">
+    <span class="tiny">Step (steer)</span><input class="num" id="stepS" value="0.06" />
+    <span class="tiny">Step (throttle)</span><input class="num" id="stepT" value="0.06" />
+    <span class="tiny">Decay</span><input class="num" id="decay" value="0.00" />
+    <span class="tiny" style="margin-left:auto;">Rate: <span id="rate">0</span> Hz</span>
+  </div>
+
+  <div class="tiny" style="margin-top:10px;">
+    Keys: ← → / A D (steer), ↑ ↓ / W S (throttle), Space (neutral), C (center), X (stop), Q (disconnect)
+  </div>
+</div>
+
+<script>
+(() => {
+  const vid = document.getElementById('video');
+  const wsurl = document.getElementById('wsurl');
+  const connectBtn = document.getElementById('connect');
+  const disconnectBtn = document.getElementById('disconnect');
+  const dot = document.getElementById('dot'); const stat = document.getElementById('stat');
+  const sbar = document.getElementById('sbar'), sfill = document.getElementById('sfill'), sval = document.getElementById('sval');
+  const tbar = document.getElementById('tbar'), tfill = document.getElementById('tfill'), tval = document.getElementById('tval');
+  const stepS = document.getElementById('stepS'), stepT = document.getElementById('stepT'), decayIn = document.getElementById('decay');
+  const rateEl = document.getElementById('rate');
+
+  let ws = null, pc = null;
+  let steer = 0.0, throttle = 0.0;
+  let sendCount = 0, lastRate = performance.now();
+
+  const clamp = (x, lo, hi) => x < lo ? lo : (x > hi ? hi : x);
+  const setStatus = (ok, text) => { dot.className='dot ' + (ok===true?'ok':ok===false?'err':''); stat.textContent=text; };
+
+  function updateBars() {
+    sval.textContent = steer.toFixed(2);
+    tval.textContent = throttle.toFixed(2);
+    const sw = Math.abs(steer)*50; sfill.style.left = (steer>=0?50:50-sw)+'%'; sfill.style.width = sw+'%'; sbar.classList.toggle('neg', steer<0);
+    const tw = Math.abs(throttle)*50; tfill.style.left = (throttle>=0?50:50-tw)+'%'; tfill.style.width = tw+'%'; tbar.classList.toggle('neg', throttle<0);
+  }
+
+  function sendControl() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({type:'control', steer, throttle}));
+    sendCount++;
+  }
+
+  async function startWebRTC() {
+    pc = new RTCPeerConnection({iceServers: [{urls: ['stun:stun.l.google.com:19302']}]});
+    pc.ontrack = (ev) => { if (ev.streams && ev.streams[0]) vid.srcObject = ev.streams[0]; };
+    pc.addTransceiver('video', {direction: 'recvonly'});
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type:'webrtc_ice', candidate: ev.candidate}));
+      }
+    };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    ws.send(JSON.stringify({type:'webrtc_offer', sdp: offer.sdp}));
+  }
+
+  function connect() {
+    if (ws && ws.readyState === WebSocket.OPEN) return;
+    try { ws = new WebSocket(wsurl.value); } catch(e) { setStatus(false,'invalid URL'); return; }
+    setStatus(null, 'connecting…');
+    ws.onopen = () => { setStatus(true,'connected'); startWebRTC(); };
+    ws.onclose = () => { setStatus(false,'disconnected'); if (pc) { pc.close(); pc=null; } };
+    ws.onerror = () => { setStatus(false,'error'); };
+    ws.onmessage = async (evt) => {
+      let msg = null;
+      try { msg = JSON.parse(evt.data); } catch(e) { return; }
+      if (msg.type === 'webrtc_answer' && pc) {
+        await pc.setRemoteDescription({type:'answer', sdp: msg.sdp});
+      } else if (msg.type === 'webrtc_ice' && pc) {
+        const c = msg.candidate || {};
+        try { await pc.addIceCandidate(c); } catch(e) {}
+      }
+    };
+  }
+  function disconnect() { if (ws) { ws.close(); ws=null; } if (pc) { pc.close(); pc=null; } setStatus(false,'disconnected'); }
+
+  connectBtn.onclick = connect; disconnectBtn.onclick = disconnect;
+
+  const keys = new Set();
+  window.addEventListener('keydown', (e) => {
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+    if (e.repeat) return; keys.add(e.key);
+    if (e.key.toLowerCase()==='c') steer=0.0;
+    if (e.key.toLowerCase()==='x') { steer=0.0; throttle=0.0; }
+    if (e.key===' ') throttle=0.0;
+    if (e.key.toLowerCase()==='q') disconnect();
+  });
+  window.addEventListener('keyup', (e) => { keys.delete(e.key); });
+
+  function tick(ts) {
+  const sStep = parseFloat(stepS.value||'0.06');   // how fast to re-center steering
+  const tStep = parseFloat(stepT.value||'0.06');   // how fast to return throttle to neutral
+  const decay = clamp(parseFloat(decayIn.value||'0.00'), 0, 1); // optional extra smoothing
+
+  const steerLeft  = keys.has('ArrowLeft') || keys.has('a') || keys.has('A');
+  const steerRight = keys.has('ArrowRight')|| keys.has('d') || keys.has('D');
+  const throttleUp = keys.has('ArrowUp')   || keys.has('w') || keys.has('W');
+  const throttleDn = keys.has('ArrowDown') || keys.has('s') || keys.has('S');
+
+  // 1) Apply active inputs
+  if (steerLeft)  steer  -= sStep;
+  if (steerRight) steer  += sStep;
+  if (throttleUp) throttle += tStep;
+  if (throttleDn) throttle -= tStep;
+
+  // 2) If no steering key is pressed, steer returns to center
+  if (!steerLeft && !steerRight) {
+    if (Math.abs(steer) <= sStep) steer = 0;
+    else steer += (steer > 0 ? -sStep : sStep);
+  }
+
+  // 3) If no throttle key is pressed, throttle returns to neutral
+  if (!throttleUp && !throttleDn) {
+    if (Math.abs(throttle) <= tStep) throttle = 0;
+    else throttle += (throttle > 0 ? -tStep : tStep);
+  }
+
+  // 4) Optional extra smoothing (kept from your UI)
+  if (decay > 0) { steer *= (1 - decay); throttle *= (1 - decay); }
+
+  // Clamp & update UI
+  steer = clamp(steer, -1, 1);
+  throttle = clamp(throttle, -1, 1);
+  updateBars();
+
+  // Send control packet
+  sendControl();
+
+  // Simple rate meter
+  if (ts - lastRate > 1000) { rateEl.textContent = String(sendCount); sendCount = 0; lastRate = ts; }
+
+  requestAnimationFrame(tick);
+}
+
+function tick(ts) {
+  const sStep = parseFloat(stepS.value||'0.06');   // how fast to re-center steering
+  const tStep = parseFloat(stepT.value||'0.06');   // how fast to return throttle to neutral
+  const decay = clamp(parseFloat(decayIn.value||'0.00'), 0, 1); // optional extra smoothing
+
+  const steerLeft  = keys.has('ArrowLeft') || keys.has('a') || keys.has('A');
+  const steerRight = keys.has('ArrowRight')|| keys.has('d') || keys.has('D');
+  const throttleUp = keys.has('ArrowUp')   || keys.has('w') || keys.has('W');
+  const throttleDn = keys.has('ArrowDown') || keys.has('s') || keys.has('S');
+
+  // 1) Apply active inputs
+  if (steerLeft)  steer  -= sStep;
+  if (steerRight) steer  += sStep;
+  if (throttleUp) throttle += tStep;
+  if (throttleDn) throttle -= tStep;
+
+  // 2) If no steering key is pressed, steer returns to center
+  if (!steerLeft && !steerRight) {
+    if (Math.abs(steer) <= sStep) steer = 0;
+    else steer += (steer > 0 ? -sStep : sStep);
+  }
+
+  // 3) If no throttle key is pressed, throttle returns to neutral
+  if (!throttleUp && !throttleDn) {
+    if (Math.abs(throttle) <= tStep) throttle = 0;
+    else throttle += (throttle > 0 ? -tStep : tStep);
+  }
+
+  // 4) Optional extra smoothing (kept from your UI)
+  if (decay > 0) { steer *= (1 - decay); throttle *= (1 - decay); }
+
+  // Clamp & update UI
+  steer = clamp(steer, -1, 1);
+  throttle = clamp(throttle, -1, 1);
+  updateBars();
+
+  // Send control packet
+  sendControl();
+
+  // Simple rate meter
+  if (ts - lastRate > 1000) { rateEl.textContent = String(sendCount); sendCount = 0; lastRate = ts; }
+
+  requestAnimationFrame(tick);
+}
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
