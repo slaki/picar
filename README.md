@@ -1,7 +1,25 @@
 # picar
 
 ## First steps
+Create a python3 venv:
+```bash
+python3 -m venv .venv
+```
+
+Use the prepared python3 venv:
+```bash
+source .venv/bin/activate
+```
+
+Update pip:
+```bash
+python3 -m pip install --upgrade pip
+```
+
 Install packages from **requirements.txt** -  e.g. under a venv
+```bash
+pip install -r requirements.txt
+```
 
 ## Starting the server components
 
